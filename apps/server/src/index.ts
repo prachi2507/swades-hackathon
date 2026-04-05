@@ -4,8 +4,9 @@ import { logger } from "hono/logger";
 import { eq } from "drizzle-orm";
 import { db, chunks } from "@my-better-t-app/db";
 import { env } from "@my-better-t-app/env/server";
-import { writeFile, mkdir, access } from "fs/promises";
+import { writeFile, mkdir, access, readFile } from "fs/promises";
 import { join } from "path";
+import Groq from "groq-sdk";
 
 const app = new Hono();
 
@@ -16,6 +17,7 @@ app.use("/*", cors({
 }));
 
 const BUCKET_DIR = join(process.cwd(), "local-bucket");
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 async function ensureDir(sessionId: string) {
   const dir = join(BUCKET_DIR, sessionId);
@@ -81,31 +83,55 @@ app.get("/api/chunks/reconcile/:sessionId", async (c) => {
 });
 
 app.get("/api/chunks/transcript/:sessionId", async (c) => {
-  const sessionId = c.req.param("sessionId");
-  const ackedChunks = await db.select().from(chunks)
-    .where(eq(chunks.sessionId, sessionId));
+  try {
+    const sessionId = c.req.param("sessionId");
+    const ackedChunks = await db.select().from(chunks)
+      .where(eq(chunks.sessionId, sessionId));
 
-  const mockTranscripts = [
-    "Can we move the deadline to next Friday?",
-    "Sure, that works for the team.",
-    "I will update the project board accordingly.",
-    "Thanks, let us sync again tomorrow.",
-    "Sounds good, talk soon.",
-  ];
+    if (ackedChunks.length === 0) {
+      return c.json({ error: "No chunks found" }, 404);
+    }
 
-  return c.json({
-    sessionId,
-    totalChunks: ackedChunks.length,
-    status: "pipeline_ready",
-    message: "In production: chunks sent to Whisper/Deepgram for transcription",
-    chunks: ackedChunks.map((chunk, i) => ({
-      chunkId: chunk.chunkId,
-      bucketKey: chunk.bucketKey,
-      ackedAt: chunk.ackedAt,
-      speaker: i % 2 === 0 ? "Speaker A" : "Speaker B",
-      transcript: mockTranscripts[i % mockTranscripts.length],
-    })),
-  });
-});
+    const results = await Promise.all(
+      ackedChunks.map(async (chunk, i) => {
+        try {
+          const filePath = join(BUCKET_DIR, chunk.bucketKey);
+          const fileBuffer = await readFile(filePath);
+          const file = new File([fileBuffer], "chunk.wav", { type: "audio/wav" });
 
-export default app;
+          const transcription = await groq.audio.transcriptions.create({
+            file,
+            model: "whisper-large-v3",
+            language: "en",
+          });
+
+          return {
+            chunkId: chunk.chunkId,
+            index: i + 1,
+            speaker: i % 2 === 0 ? "Speaker A" : "Speaker B",
+            transcript: transcription.text,
+            ackedAt: chunk.ackedAt,
+          };
+        } catch (err) {
+          console.error(`Transcription failed for chunk ${chunk.chunkId}:`, err);
+          return {
+            chunkId: chunk.chunkId,
+            index: i + 1,
+            speaker: i % 2 === 0 ? "Speaker A" : "Speaker B",
+            transcript: "[transcription failed for this chunk]",
+            ackedAt: chunk.ackedAt,
+          };
+        }
+      })
+    );
+
+    return c.json({
+      sessionId,
+      totalChunks: ackedChunks.length,
+      status: "transcribed",
+      message: "Transcribed using Whisper via Groq API",
+      chunks: results,
+    });
+  } catch (err) {
+    console.error("Transcript error:", err);
+    return c.json({ error: "Transc
